@@ -31,12 +31,69 @@ def load_ingredients():
     data = r.json()
 
     out = {}
-    for item in data["ingredients"]:
-        name = item["name"]
-        effects = item["effects"]
-        if len(effects) == 4:
-            out[name] = effects
+    # Expected structure: {"ingredients":[{"name":..., "effects":[...4...]}, ...]}
+    for item in data.get("ingredients", []):
+        name = str(item.get("name", "")).strip()
+        effects = item.get("effects", [])
+        if name and isinstance(effects, list) and len(effects) == 4:
+            out[name] = [str(e).strip() for e in effects]
     return out
+
+
+def _pick_effect_and_value_columns(df: pd.DataFrame) -> tuple[str, str]:
+    """
+    Tries to infer:
+      - effect name column (text)
+      - value column (numeric)
+    Works even if columns are named unexpectedly.
+    """
+    cols = list(df.columns)
+
+    # Prefer common name columns
+    preferred_name_cols = ["effect", "name", "Effect", "Name", "effect_name", "EffectName"]
+    name_col = None
+    for c in preferred_name_cols:
+        if c in df.columns:
+            name_col = c
+            break
+    if name_col is None:
+        # fallback: first object/string-like column
+        for c in cols:
+            if df[c].dtype == object:
+                name_col = c
+                break
+    if name_col is None:
+        # last resort: first column
+        name_col = cols[0]
+
+    # Prefer common value columns
+    preferred_value_cols = ["value", "Value", "gold", "Gold", "cost", "Cost", "base_value", "BaseValue", "basecost", "Base cost"]
+    value_col = None
+    for c in preferred_value_cols:
+        if c in df.columns:
+            value_col = c
+            break
+    if value_col is None:
+        # fallback: first numeric column
+        for c in cols:
+            if pd.api.types.is_numeric_dtype(df[c]):
+                value_col = c
+                break
+    if value_col is None:
+        # fallback: try converting columns to numeric and pick the best
+        best = None
+        best_nonnull = -1
+        for c in cols:
+            if c == name_col:
+                continue
+            s = pd.to_numeric(df[c], errors="coerce")
+            nn = int(s.notna().sum())
+            if nn > best_nonnull:
+                best_nonnull = nn
+                best = c
+        value_col = best if best is not None else cols[-1]
+
+    return name_col, value_col
 
 
 @st.cache_data(show_spinner=False)
@@ -44,12 +101,27 @@ def load_effect_values():
     """
     Returns:
       { "Fortify Health": 350, ... }
-    Base single-effect potion values.
+    Base single-effect potion values for ranking.
+    Loader is robust to varying CSV column names.
     """
-    df = pd.read_csv(EFFECTS_URL)
-    df["effect"] = df["effect"].astype(str)
-    df["value"] = pd.to_numeric(df["value"], errors="coerce").fillna(0)
-    return dict(zip(df["effect"], df["value"]))
+    # Let pandas sniff separators if needed
+    df = pd.read_csv(EFFECTS_URL, sep=None, engine="python")
+
+    if df.empty or len(df.columns) < 2:
+        raise RuntimeError("Effects CSV loaded but appears empty or malformed.")
+
+    name_col, value_col = _pick_effect_and_value_columns(df)
+
+    # Normalize
+    names = df[name_col].astype(str).str.strip()
+    vals = pd.to_numeric(df[value_col], errors="coerce").fillna(0)
+
+    eff_vals = {}
+    for n, v in zip(names, vals):
+        if n:
+            eff_vals[n] = int(v) if float(v).is_integer() else float(v)
+
+    return eff_vals
 
 
 # ============================================================
@@ -80,29 +152,39 @@ def top_k_potions(selected, ing_db, eff_vals, include_2, include_3, query):
             if not effs:
                 continue
 
-            value = sum(eff_vals.get(e, 0) for e in effs)
-            if value <= 0:
+            # Value = sum of each shared effect's base value
+            value = 0
+            known = []
+            for e in effs:
+                v = eff_vals.get(e, 0)
+                if v:
+                    value += float(v)
+                    known.append(e)
+
+            if value <= 0 or not known:
                 continue
 
-            potion = "Potion of " + " + ".join(sorted(effs))
+            known_sorted = sorted(set(known))
+            potion = "Potion of " + " + ".join(known_sorted)
+
             row = {
-                "Value": value,
+                "Value": int(value) if float(value).is_integer() else value,
                 "Potion": potion,
                 "Ingredients": ", ".join(combo),
-                "Effects": ", ".join(sorted(effs)),
+                "Effects": ", ".join(known_sorted),
             }
 
             if q:
-                blob = (row["Potion"] + row["Ingredients"] + row["Effects"]).lower()
+                blob = (row["Potion"] + " " + row["Ingredients"] + " " + row["Effects"]).lower()
                 if q not in blob:
                     continue
 
             tie += 1
-            item = (value, tie, row)
+            item = (float(value), tie, row)
 
             if len(heap) < TOP_K:
                 heapq.heappush(heap, item)
-            elif value > heap[0][0]:
+            elif float(value) > heap[0][0]:
                 heapq.heapreplace(heap, item)
 
     if not heap:
@@ -127,7 +209,7 @@ all_ingredients = sorted(ing_db.keys())
 selected = st.multiselect(
     "Available ingredients (unselect what you don't have)",
     options=all_ingredients,
-    default=all_ingredients,
+    default=all_ingredients,  # default to ALL selected like you want
 )
 
 with st.sidebar:
@@ -147,7 +229,7 @@ with st.spinner("Calculating top 10..."):
         query=query,
     )
 
-st.write(f"Showing top {len(df)} craftable potions")
+st.write(f"Showing top {len(df)} craftable potions (top 10 max)")
 st.dataframe(df, use_container_width=True, hide_index=True)
 
 st.download_button(
@@ -155,4 +237,4 @@ st.download_button(
     data=df.to_csv(index=False).encode("utf-8"),
     file_name="skyrim_potions_top10.csv",
     mime="text/csv",
-    )
+            )
