@@ -77,7 +77,7 @@ def load_effects() -> Dict[str, EffectInfo]:
     Parses UESP Alchemy Effects table to get Base cost / Base magnitude / Base duration.
     """
     html = requests.get(UESP_EFFECTS_URL, timeout=30).text
-    soup = BeautifulSoup(html, "lxml")
+    soup = BeautifulSoup(html, "html.parser") 
 
     # UESP has tables; we look for rows containing effect name and numeric base fields.
     # This parser is intentionally tolerant.
